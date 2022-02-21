@@ -197,15 +197,188 @@ drug_dataset_reloaded = load_dataset("json", data_files=data_files)
 
 ## Big data? 🤗 Datasets to the rescue!
 
+It is hard to work with gigantic datasets on your local machine if you try to load it all into ram at 1 time. This is where Datasets comes in handy, it allows you to stream data so that you can look at a slidingh window of the dataset and not load more than you need!
+
+### Loading Pile Dataset
+
+THe pile is a multi-domain dataset which has 14gb train splits that contains 815GB data in total!
+
+```python
+from datasets import load_dataset
+
+# This takes a few minutes to run, so go grab a tea or coffee while you wait :)
+data_files = "https://mystic.the-eye.eu/public/AI/pile_preliminary_components/PUBMED_title_abstracts_2019_baseline.jsonl.zst"
+pubmed_dataset = load_dataset("json", data_files=data_files, split="train")
+pubmed_dataset
+```
+
+Check how much ram this taskes:
+
+```python
+import psutil
+
+# Process.memory_info is expressed in bytes, so convert to megabytes
+print(f"RAM used: {psutil.Process().memory_info().rss / (1024 * 1024):.2f} MB")
+```
+
+```python
+RAM used: 5678.33 MB
+```
+
+Streaming datasets
+
+```python
+pubmed_dataset_streamed = load_dataset(
+    "json", data_files=data_files, split="train", streaming=True
+)
+```
+
+Iterate through the dataset
+
+```python
+next(iter(pubmed_dataset_streamed))
+```
+
+Tokenize streamed data
+
+```python
+from transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+tokenized_dataset = pubmed_dataset_streamed.map(lambda x: tokenizer(x["text"]))
+next(iter(tokenized_dataset))
+```
+
+Shuffle a batch of data
+
+```python
+shuffled_dataset = pubmed_dataset_streamed.shuffle(buffer_size=10_000, seed=42)
+next(iter(shuffled_dataset))
+```
+
+```python
+# Skip the first 1,000 examples and include the rest in the training set
+train_dataset = shuffled_dataset.skip(1000)
+# Take the first 1,000 examples for the validation set
+validation_dataset = shuffled_dataset.take(1000)
+```
+
+Ciombine two datasets to iterate over in tandem
+
+```python
+from itertools import islice
+from datasets import interleave_datasets
+
+combined_dataset = interleave_datasets([pubmed_dataset_streamed, law_dataset_streamed])
+list(islice(combined_dataset, 2))
+```
+
+Loading all datasets in the pile via streaming:
+
+```python
+base_url = "https://mystic.the-eye.eu/public/AI/pile/"
+data_files = {
+    "train": [base_url + "train/" + f"{idx:02d}.jsonl.zst" for idx in range(30)],
+    "validation": base_url + "val.jsonl.zst",
+    "test": base_url + "test.jsonl.zst",
+}
+pile_dataset = load_dataset("json", data_files=data_files, streaming=True)
+next(iter(pile_dataset["train"]))
+```
+
 
 
 ## Creating your own dataset
+
+Get Dataset from HF Hub
+
+```python
+from huggingface_hub import list_datasets
+
+all_datasets = list_datasets()
+print(f"Number of datasets on Hub: {len(all_datasets)}")
+print(all_datasets[0])
+```
+
+Login from notebook to HF Hub
+
+```py
+from huggingface_hub import notebook_login
+
+notebook_login()
+```
+
+Create Repo an upload data
+
+```python
+from huggingface_hub import create_repo
+
+repo_url = create_repo(name="github-issues", repo_type="dataset")
+repo_url
+
+from huggingface_hub import Repository
+
+repo = Repository(local_dir="github-issues", clone_from=repo_url)
+!cp datasets-issues-with-comments.jsonl github-issues/
+
+repo.lfs_track("*.jsonl")
+repo.push_to_hub()
+
+# Load Dataset
+remote_dataset = load_dataset("miesnerjacob/github-issues", split="train")
+remote_dataset
+```
 
 
 
 ## Semantic search with FAISS
 
+Method to get embeddings via CLS pooling and sentence transformers model
+
+```python
+# Turn text into embeddings
+def get_embeddings(text_list):
+    encoded_input = tokenizer(
+        text_list, padding=True, truncation=True, return_tensors="pt"
+    )
+    encoded_input = {k: v.to(device) for k, v in encoded_input.items()}
+    model_output = model(**encoded_input)
+    return cls_pooling(model_output)
+```
+
+Get FAISS index using HF method!
+
+```python
+# Add FAISS index to dataset
+embeddings_dataset.add_faiss_index(column="embeddings")
+```
+
+Encode question we want to answer
+
+```python
+# Encode question
+question = "How can I a dataset to a pandas DataFrame?"
+question_embedding = get_embeddings([question]).cpu().detach().numpy()
+question_embedding.shape
+```
+
+Find answers
+
+```python
+# Lookup on FIASS index for most similar examples
+scores, samples = embeddings_dataset.get_nearest_examples(
+    "embeddings", question_embedding, k=5
+)
+```
+
 
 
 ## 🤗 Datasets, check!
 
+This chapter covered the following:
+
+- Load datasets from anywhere, be it the Hugging Face Hub, your laptop, or a remote server at your company.
+- Wrangle your data using a mix of the `Dataset.map()` and `Dataset.filter()` functions.
+- Quickly switch between data formats like Pandas and NumPy using `Dataset.set_format()`.
+- Create your very own dataset and push it to the Hugging Face Hub.
+- Embed your documents using a Transformer model and build a semantic search engine using FAISS.
