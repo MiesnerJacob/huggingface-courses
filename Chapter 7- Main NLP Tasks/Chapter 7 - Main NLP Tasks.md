@@ -1,4 +1,4 @@
-# xMain NLP Tasks
+# Main NLP Tasks
 
 ## Introduction
 
@@ -1815,31 +1815,992 @@ print_summary(0)
 
 ## Training a casual language model from scratch
 
+In previous sections, we have mostly fine-tuned existing pre-trained models. This works really well for most real-world use-cases where your dataset is limited in size. In this section, we will train a model from scratch! This is a viable approach if you have a large amount of data or where your new data is niche like musical notes, molecular sequences such as DNA, or programming languages.
+
+In this section, we will build a model that will generate one-line completions of Python code (ex. looking up a function name). We will have our model generate code using some common Python libraries such as matplotlib, seaborn, pandas, and scikit-learn.
+
 ### Gathering the data
+
+To train our causal model we will use a GitHub dump of about 180 GB containing roughly 20 million Python files called `codeparrot`. We will not be using this whole dataset but will filter to just the entries that contain code for one of the four libraries we want to teach our model to write code for. To avoid having to download a 180GB dataset we will stream the data in and filter it on the fly.
+
+So first, lets create our function to filter the dataset:
+
+```python
+def any_keyword_in_string(string, keywords):
+    for keyword in keywords:
+        if keyword in string:
+            return True
+    return False
+  
+# Lets test it out on an example
+filters = ["pandas", "sklearn", "matplotlib", "seaborn"]
+example_1 = "import numpy as np"
+example_2 = "import pandas as pd"
+
+print(
+    any_keyword_in_string(example_1, filters), any_keyword_in_string(example_2, filters)
+)
+
+False True
+```
+
+Now let's create a function to accept an entire dataset and iterate through it, grabbing only the relevant entries:
+
+```python
+from collections import defaultdict
+from tqdm import tqdm
+from datasets import Dataset
+
+
+def filter_streaming_dataset(dataset, filters):
+    filtered_dict = defaultdict(list)
+    total = 0
+    for sample in tqdm(iter(dataset)):
+        total += 1
+        if any_keyword_in_string(sample["content"], filters):
+            for k, v in sample.items():
+                filtered_dict[k].append(v)
+    print(f"{len(filtered_dict['content'])/total:.2%} of data after filtering.")
+    return Dataset.from_dict(filtered_dict)
+  
+# Now lets apply this to our data
+from datasets import load_dataset
+
+split = "train"  # "valid"
+filters = ["pandas", "sklearn", "matplotlib", "seaborn"]
+
+data = load_dataset(f"transformersbook/codeparrot-{split}", split=split, streaming=True)
+filtered_data = filter_streaming_dataset(data, filters)
+
+'3.26% of data after filtering.'
+```
+
+Despite being left with only 3% of the data after filtering, this dataset is still roughly 6GB and contains ~600K code examples. Actually filtering this entire dataset can take hours depending on what machine you are using, so HF has saved us the time and provided an already filtered version!
+
+Let's check it out:
+
+```python
+from datasets import load_dataset, DatasetDict
+
+ds_train = load_dataset("huggingface-course/codeparrot-ds-train", split="train")
+ds_valid = load_dataset("huggingface-course/codeparrot-ds-valid", split="validation")
+
+raw_datasets = DatasetDict(
+    {
+        "train": ds_train,  # .shuffle().select(range(50000)),
+        "valid": ds_valid,  # .shuffle().select(range(500))
+    }
+)
+
+raw_datasets
+
+DatasetDict({
+    train: Dataset({
+        features: ['repo_name', 'path', 'copies', 'size', 'content', 'license'],
+        num_rows: 606720
+    })
+    valid: Dataset({
+        features: ['repo_name', 'path', 'copies', 'size', 'content', 'license'],
+        num_rows: 3322
+    })
+})
+
+# Let's take a look at one of the examples
+for key in raw_datasets["train"][0]:
+    print(f"{key.upper()}: {raw_datasets['train'][0][key][:200]}")
+    
+'REPO_NAME: kmike/scikit-learn'
+'PATH: sklearn/utils/__init__.py'
+'COPIES: 3'
+'SIZE: 10094'
+'''CONTENT: """
+The :mod:`sklearn.utils` module includes various utilites.
+"""
+
+from collections import Sequence
+
+import numpy as np
+from scipy.sparse import issparse
+import warnings
+
+from .murmurhash import murm
+LICENSE: bsd-3-clause'''
+```
+
+The data looks solid! In the next section, we will work on prepping this data for pre-training.
 
 ### Preparing the dataset
 
+Ok, so the first step is to tokenize our data. Since we are training a model to do one-line autocompletes we don't need a ton of context in each training example. This will also decrease the amount of computation needed. Our training examples will be 128 tokens in length, which is small compared to large models like GPT-3 which uses 2,048 tokens!!!
+
+We will use the return_overflowing_tokens param during tokenization to make sure we aren't throwing away all the data in our examples after the first 128 tokens. We will toss the final split if it is less than 128 tokens so we can avoid padding issues.
+
+Let's start by tokenizing a few examples and checking them out:
+
+```python
+from transformers import AutoTokenizer
+
+context_length = 128
+tokenizer = AutoTokenizer.from_pretrained("huggingface-course/code-search-net-tokenizer")
+
+outputs = tokenizer(
+    raw_datasets["train"][:2]["content"],
+    truncation=True,
+    max_length=context_length,
+    return_overflowing_tokens=True,
+    return_length=True,
+)
+
+print(f"Input IDs length: {len(outputs['input_ids'])}")
+print(f"Input chunk lengths: {(outputs['length'])}")
+print(f"Chunk mapping: {outputs['overflow_to_sample_mapping']}")
+
+'Input IDs length: 34'
+'Input chunk lengths: [128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 117, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 41]'
+'Chunk mapping: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]'
+```
+
+Next, we tokenize our entire dataset. We will map a tokenize function to our dataset so that we can remove those chunks with lengths less than 128 tokens:
+
+```python
+def tokenize(element):
+    outputs = tokenizer(
+        element["content"],
+        truncation=True,
+        max_length=context_length,
+        return_overflowing_tokens=True,
+        return_length=True,
+    )
+    input_batch = []
+    for length, input_ids in zip(outputs["length"], outputs["input_ids"]):
+        if length == context_length:
+            input_batch.append(input_ids)
+    return {"input_ids": input_batch}
+
+
+tokenized_datasets = raw_datasets.map(
+    tokenize, batched=True, remove_columns=raw_datasets["train"].column_names
+)
+tokenized_datasets
+
+DatasetDict({
+    train: Dataset({
+        features: ['input_ids'],
+        num_rows: 16702061
+    })
+    valid: Dataset({
+        features: ['input_ids'],
+        num_rows: 93164
+    })
+})
+```
+
+We now have 16.7 million examples with 128 tokens each, which corresponds to about 2.1 billion tokens in total. For reference, OpenAI’s GPT-3 and Codex models are trained on 300 and 100 billion tokens, respectively, where the Codex models are initialized from the GPT-3 checkpoints.
+
 ### Initializing a new model
+
+Our first step is to initialize the skeleton of a GPT-2 model. We will set the context size to our 128 tokens, and set the beg and end tokens to match our tokenizer:
+
+```python
+from transformers import AutoTokenizer, GPT2LMHeadModel, AutoConfig
+
+config = AutoConfig.from_pretrained(
+    "gpt2",
+    vocab_size=len(tokenizer),
+    n_ctx=context_length,
+    bos_token_id=tokenizer.bos_token_id,
+    eos_token_id=tokenizer.eos_token_id,
+)
+
+# Next let's attach an LM head and check out the model size
+model = GPT2LMHeadModel(config)
+model_size = sum(t.numel() for t in model.parameters())
+print(f"GPT-2 size: {model_size/1000**2:.1f}M parameters")
+
+'GPT-2 size: 124.2M parameters'
+```
+
+Next, we will load in a DataCollator to handle batching our inputs for us. Besides stacking and padding batches, it also takes care of creating the language model labels — in causal language modeling the inputs serve as labels too (just shifted by one element), and this data collator creates them on the fly during training so we don’t need to duplicate the `input_ids`.
+
+```python
+from transformers import DataCollatorForLanguageModeling
+
+tokenizer.pad_token = tokenizer.eos_token
+data_collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
+
+# Let's test it out
+out = data_collator([tokenized_datasets["train"][i] for i in range(5)])
+for key in out:
+    print(f"{key} shape: {out[key].shape}")
+
+'input_ids shape: torch.Size([5, 128])'
+'attention_mask shape: torch.Size([5, 128])'
+'labels shape: torch.Size([5, 128])'
+
+```
+
+Next, let's get to training! You have the option to load this to the HF Hub or not:
+
+```python
+from transformers import Trainer, TrainingArguments
+
+# Define training arguements
+args = TrainingArguments(
+    output_dir="codeparrot-ds",
+    per_device_train_batch_size=32,
+    per_device_eval_batch_size=32,
+    evaluation_strategy="steps",
+    eval_steps=5_000,
+    logging_steps=5_000,
+    gradient_accumulation_steps=8,
+    num_train_epochs=1,
+    weight_decay=0.1,
+    warmup_steps=1_000,
+    lr_scheduler_type="cosine",
+    learning_rate=5e-4,
+    save_steps=5_000,
+    fp16=True,
+    push_to_hub=False
+)
+
+# Instantiate trainer object
+trainer = Trainer(
+    model=model,
+    tokenizer=tokenizer,
+    args=args,
+    data_collator=data_collator,
+    train_dataset=tokenized_datasets["train"],
+    eval_dataset=tokenized_datasets["valid"],
+)
+
+# Train!!!!!
+trainer.train()
+```
+
+
 
 ### Code generation with a pipeline
 
+Now, let's load up the model into a test generation pipeline and test it out:
+
+```python
+# Load up the model via pipelines
+import torch
+from transformers import pipeline
+
+device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+pipe = pipeline(
+    "text-generation", model="huggingface-course/codeparrot-ds", device=device
+)
+
+# Generate code!
+txt = """\
+# create some data
+x = np.random.randn(100)
+y = np.random.randn(100)
+
+# create scatter plot with x, y
+"""
+print(pipe(txt, num_return_sequences=1)[0]["generated_text"])
+
+"""# create some data
+x = np.random.randn(100)
+y = np.random.randn(100)
+
+# create scatter plot with x, y
+plt.scatter(x, y)
+
+# create scatter"""
+```
+
+Often times we may want to customize our training for our specific use case, for these cases it is better to build a training loop with accelerate.
+
 ### Training with 🤗 Accelerate
+
+In this example, we will train our model with a custom loss function that puts extra weight on examples that contain some of the most important methods used in the four Python libraries we are training our model to write.
+
+First, lets create our custom loss function:
+
+```python
+from torch.nn import CrossEntropyLoss
+import torch
+
+
+def keytoken_weighted_loss(inputs, logits, keytoken_ids, alpha=1.0):
+    # Shift so that tokens < n predict n
+    shift_labels = inputs[..., 1:].contiguous()
+    shift_logits = logits[..., :-1, :].contiguous()
+    # Calculate per-token loss
+    loss_fct = CrossEntropyLoss(reduce=False)
+    loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+    # Resize and average loss per sample
+    loss_per_sample = loss.view(shift_logits.size(0), shift_logits.size(1)).mean(axis=1)
+    # Calculate and scale weighting
+    weights = torch.stack([(inputs == kt).float() for kt in keytoken_ids]).sum(
+        axis=[0, 2]
+    )
+    weights = alpha * (1.0 + weights)
+    # Calculate weighted average
+    weighted_loss = (loss_per_sample * weights).mean()
+    return weighted_loss
+```
+
+Next lets create our Dataloaders:
+
+```python
+from torch.utils.data.dataloader import DataLoader
+
+tokenized_dataset.set_format("torch")
+train_dataloader = DataLoader(tokenized_dataset["train"], batch_size=32, shuffle=True)
+eval_dataloader = DataLoader(tokenized_dataset["valid"], batch_size=32)
+```
+
+Then, we will create a function to calculate our weight decay:
+
+```python
+weight_decay = 0.1
+
+
+def get_grouped_params(model, no_decay=["bias", "LayerNorm.weight"]):
+    params_with_wd, params_without_wd = [], []
+    for n, p in model.named_parameters():
+        if any(nd in n for nd in no_decay):
+            params_without_wd.append(p)
+        else:
+            params_with_wd.append(p)
+    return [
+        {"params": params_with_wd, "weight_decay": weight_decay},
+        {"params": params_without_wd, "weight_decay": 0.0},
+    ]
+```
+
+And an evaluation function:
+
+```python
+def evaluate():
+    model.eval()
+    losses = []
+    for step, batch in enumerate(eval_dataloader):
+        with torch.no_grad():
+            outputs = model(batch["input_ids"], labels=batch["input_ids"])
+
+        losses.append(accelerator.gather(outputs.loss))
+    loss = torch.mean(torch.cat(losses))
+    try:
+        perplexity = torch.exp(loss)
+    except OverflowError:
+        perplexity = float("inf")
+    return loss.item(), perplexity.item()
+```
+
+Next, we re-instantiate our model:
+
+```python
+model = GPT2LMHeadModel(config)
+```
+
+Then, we create an optimizer and pass that optimizer, model, and dataloaders to accelerate:
+
+```python
+from accelerate import Accelerator
+
+accelerator = Accelerator(fp16=True)
+
+model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
+    model, optimizer, train_dataloader, eval_dataloader
+)
+```
+
+Then we get our learning rate scheduler:
+
+```python
+from transformers import get_scheduler
+
+num_train_epochs = 1
+num_update_steps_per_epoch = len(train_dataloader)
+num_training_steps = num_train_epochs * num_update_steps_per_epoch
+
+lr_scheduler = get_scheduler(
+    name="linear",
+    optimizer=optimizer,
+    num_warmup_steps=1_000,
+    num_training_steps=num_training_steps,
+)
+```
+
+Finally we write our training loop and run it:
+
+```python
+from tqdm.notebook import tqdm
+
+gradient_accumulation_steps = 8
+eval_steps = 5_000
+
+model.train()
+completed_steps = 0
+for epoch in range(num_train_epochs):
+    for step, batch in tqdm(
+        enumerate(train_dataloader, start=1), total=num_training_steps
+    ):
+        logits = model(batch["input_ids"]).logits
+        loss = keytoken_weighted_loss(batch["input_ids"], logits, keytoken_ids)
+        if step % 100 == 0:
+            accelerator.print(
+                {
+                    "lr": get_lr(),
+                    "samples": step * samples_per_step,
+                    "steps": completed_steps,
+                    "loss/train": loss.item() * gradient_accumulation_steps,
+                }
+            )
+        loss = loss / gradient_accumulation_steps
+        accelerator.backward(loss)
+        if step % gradient_accumulation_steps == 0:
+            accelerator.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
+            completed_steps += 1
+        if (step % (eval_steps * gradient_accumulation_steps)) == 0:
+            eval_loss, perplexity = evaluate()
+            accelerator.print({"loss/eval": eval_loss, "perplexity": perplexity})
+            model.train()
+            accelerator.wait_for_everyone()
+            unwrapped_model = accelerator.unwrap_model(model)
+            unwrapped_model.save_pretrained(output_dir, save_function=accelerator.save)
+            if accelerator.is_main_process:
+                tokenizer.save_pretrained(output_dir)
+                repo.push_to_hub(
+                    commit_message=f"Training in progress step {step}", blocking=False
+                )
+```
 
 
 
 ## Question answering
 
+There are multiple flavors of the question-answering task, but in this section, we will focus on extractive question answering, which invloves extracting answering from a reference document. In this section we will fine tune a BERT model on the SQuAD dataset. 
+
+BERT models are good for answering factoid-type questions but not so great at answering open-ended philosophical questions. Encoder-Decoder models like t5 and BART are better suited for general questions because they are able to generate text similar to a summarization task.
+
 ### Preparing the data
+
+Let's load in our dataset and check out an example:
+
+```python
+# Load dataset
+from datasets import load_dataset
+
+raw_datasets = load_dataset("squad")
+
+raw_datasets
+
+DatasetDict({
+    train: Dataset({
+        features: ['id', 'title', 'context', 'question', 'answers'],
+        num_rows: 87599
+    })
+    validation: Dataset({
+        features: ['id', 'title', 'context', 'question', 'answers'],
+        num_rows: 10570
+    })
+})
+
+# Print out example
+print("Context: ", raw_datasets["train"][0]["context"])
+print("Question: ", raw_datasets["train"][0]["question"])
+print("Answer: ", raw_datasets["train"][0]["answers"])
+
+Context: 'Architecturally, the school has a Catholic character. Atop the Main Building\'s gold dome is a golden statue of the Virgin Mary. Immediately in front of the Main Building and facing it, is a copper statue of Christ with arms upraised with the legend "Venite Ad Me Omnes". Next to the Main Building is the Basilica of the Sacred Heart. Immediately behind the basilica is the Grotto, a Marian place of prayer and reflection. It is a replica of the grotto at Lourdes, France where the Virgin Mary reputedly appeared to Saint Bernadette Soubirous in 1858. At the end of the main drive (and in a direct line that connects through 3 statues and the Gold Dome), is a simple, modern stone statue of Mary.'
+Question: 'To whom did the Virgin Mary allegedly appear in 1858 in Lourdes France?'
+Answer: {'text': ['Saint Bernadette Soubirous'], 'answer_start': [515]}
+```
+
+Our training data will only have one answer per question, but our validation data will have multiple answers.
+
+### Processing the Data
+
+#### Processing the Training Data
+
+The hard part of processing the training data is generating the labels for our answers (which will correspond to their start and end indexes within the reference text). 
+
+Although before we get there we have to import our text and generated input_ids the model will recognize. So le'ts start off by loading in our tokenizer:
+
+```python
+from transformers import AutoTokenizer
+
+model_checkpoint = "bert-base-cased"
+tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
+```
+
+We use bert in this example, but we could use any other architecture that has fast tokenization implemented. The tokenized sequences will be structured like this:
+
+```python
+[CLS] question [SEP] context [SEP]
+```
+
+Here we can see an example:
+
+```python
+# Get one example of context and question
+context = raw_datasets["train"][0]["context"]
+question = raw_datasets["train"][0]["question"]
+
+# Pass examples to tokenizer
+inputs = tokenizer(question, context)
+
+# Decode input ids to view data format as outlined above
+tokenizer.decode(inputs["input_ids"])
+
+'[CLS] To whom did the Virgin Mary allegedly appear in 1858 in Lourdes France? [SEP] Architecturally, '
+'the school has a Catholic character. Atop the Main Building\'s gold dome is a golden statue of the Virgin '
+'Mary. Immediately in front of the Main Building and facing it, is a copper statue of Christ with arms '
+'upraised with the legend " Venite Ad Me Omnes ". Next to the Main Building is the Basilica of the Sacred '
+'Heart. Immediately behind the basilica is the Grotto, a Marian place of prayer and reflection. It is a '
+'replica of the grotto at Lourdes, France where the Virgin Mary reputedly appeared to Saint Bernadette '
+'Soubirous in 1858. At the end of the main drive ( and in a direct line that connects through 3 statues '
+'and the Gold Dome ), is a simple, modern stone statue of Mary. [SEP]'
+```
+
+The prediction our model will make is the start and end indexes of the answer within our reference document. In order to accommodate our expected sequence length from our model, we will create several training features from one sample of our dataset, with a sliding window between them.
+
+
+
+We feed the model pairs of our question along with a context chunk, which means some examples will not have the answer at all. For those examples, the labels will be `start_position = end_position = 0` (so we predict the `[CLS]` token). We will also set those labels in the unfortunate case where the answer has been truncated so that we only have the start (or end) of it.
+
+Let's tokenize:
+
+```python
+# Truncation set to "only_second" as the context is the second index in all examples
+# We return overflowing tokens to keep all our context
+# We return offsets mapping for answer indexes
+inputs = tokenizer(
+    question,
+    context,
+    max_length=100,
+    truncation="only_second",
+    stride=50,
+    return_overflowing_tokens=True,
+    return_offsets_mapping=True,
+)
+inputs.keys()
+dict_keys(['input_ids', 'token_type_ids', 'attention_mask', 'offset_mapping', 'overflow_to_sample_mapping'])
+
+
+```
+
+The inputs["overflow_to_sample_mapping"] data lets us see what example each sequence is associated with. If we use our offset maps in conjunction with the sample mapping we can confirm those examples with start and end indexes != 0 do contain answers and visa-versa.
+
+Now let's create a preprocessing function that can apply all the logic above:
+
+```python
+max_length = 384
+stride = 128
+
+
+def preprocess_training_examples(examples):
+    questions = [q.strip() for q in examples["question"]]
+    inputs = tokenizer(
+        questions,
+        examples["context"],
+        max_length=max_length,
+        truncation="only_second",
+        stride=stride,
+        return_overflowing_tokens=True,
+        return_offsets_mapping=True,
+        padding="max_length",
+    )
+
+    offset_mapping = inputs.pop("offset_mapping")
+    sample_map = inputs.pop("overflow_to_sample_mapping")
+    answers = examples["answers"]
+    start_positions = []
+    end_positions = []
+
+    for i, offset in enumerate(offset_mapping):
+        sample_idx = sample_map[i]
+        answer = answers[sample_idx]
+        start_char = answer["answer_start"][0]
+        end_char = answer["answer_start"][0] + len(answer["text"][0])
+        sequence_ids = inputs.sequence_ids(i)
+
+        # Find the start and end of the context
+        idx = 0
+        while sequence_ids[idx] != 1:
+            idx += 1
+        context_start = idx
+        while sequence_ids[idx] == 1:
+            idx += 1
+        context_end = idx - 1
+
+        # If the answer is not fully inside the context, label is (0, 0)
+        if offset[context_start][0] > start_char or offset[context_end][1] < end_char:
+            start_positions.append(0)
+            end_positions.append(0)
+        else:
+            # Otherwise it's the start and end token positions
+            idx = context_start
+            while idx <= context_end and offset[idx][0] <= start_char:
+                idx += 1
+            start_positions.append(idx - 1)
+
+            idx = context_end
+            while idx >= context_start and offset[idx][1] >= end_char:
+                idx -= 1
+            end_positions.append(idx + 1)
+
+    inputs["start_positions"] = start_positions
+    inputs["end_positions"] = end_positions
+    return inputs
+```
+
+Lastly, lets map this function to the entirety of our training data:
+
+```python
+train_dataset = raw_datasets["train"].map(
+    preprocess_training_examples,
+    batched=True,
+    remove_columns=raw_datasets["train"].column_names,
+)
+
+print(len(raw_datasets["train"]), len(train_dataset))
+'(87599, 88729)'
+```
+
+
+
+#### Processing the Validation Data
+
+Processing the validation data is a little bit easier as we don't need to generate labels. The real joy will be to interpret the predictions of the model into spans of the original context. For this, we will just need to store both the offset mappings and some way to match each created feature to the original example it comes from. Since there is an ID column in the original dataset, we’ll use that ID.
+
+```python
+def preprocess_validation_examples(examples):
+    questions = [q.strip() for q in examples["question"]]
+    inputs = tokenizer(
+        questions,
+        examples["context"],
+        max_length=max_length,
+        truncation="only_second",
+        stride=stride,
+        return_overflowing_tokens=True,
+        return_offsets_mapping=True,
+        padding="max_length",
+    )
+
+    sample_map = inputs.pop("overflow_to_sample_mapping")
+    example_ids = []
+
+    for i in range(len(inputs["input_ids"])):
+        sample_idx = sample_map[i]
+        example_ids.append(examples["id"][sample_idx])
+
+        sequence_ids = inputs.sequence_ids(i)
+        offset = inputs["offset_mapping"][i]
+        inputs["offset_mapping"][i] = [
+            o if sequence_ids[k] == 1 else None for k, o in enumerate(offset)
+        ]
+
+    inputs["example_id"] = example_ids
+    return inputs
+```
+
+Then we will apply this function to our entire validation dataset:
+
+```python
+validation_dataset = raw_datasets["validation"].map(
+    preprocess_validation_examples,
+    batched=True,
+    remove_columns=raw_datasets["validation"].column_names,
+)
+
+print(len(raw_datasets["validation"]), len(validation_dataset))
+'(10570, 10822)'
+```
+
+
 
 ### Fine-tuning the model with the `Trainer` API
 
+Before training we will need a function to predict answers and compare it to the theoretical answers to compute our SQuAD evaluation metric. In oder to do this we must:
+
+1. Get our logits for start and end indexes associated with all tokens
+
+2. Get top X answers according to logits
+
+3. Skip answers that are not fully in the context,  and skip answers with a length that is either < 0 or > max_answer_length
+
+4. Of the remaining possibilities select the one with the highest combined predicted prob of start and end indexes
+
+   
+
+   ```python
+   from tqdm.auto import tqdm
+   
+   
+   def compute_metrics(start_logits, end_logits, features, examples):
+       example_to_features = collections.defaultdict(list)
+       for idx, feature in enumerate(features):
+           example_to_features[feature["example_id"]].append(idx)
+   
+       predicted_answers = []
+       for example in tqdm(examples):
+           example_id = example["id"]
+           context = example["context"]
+           answers = []
+   
+           # Loop through all features associated with that example
+           for feature_index in example_to_features[example_id]:
+               start_logit = start_logits[feature_index]
+               end_logit = end_logits[feature_index]
+               offsets = features[feature_index]["offset_mapping"]
+   
+               start_indexes = np.argsort(start_logit)[-1 : -n_best - 1 : -1].tolist()
+               end_indexes = np.argsort(end_logit)[-1 : -n_best - 1 : -1].tolist()
+               for start_index in start_indexes:
+                   for end_index in end_indexes:
+                       # Skip answers that are not fully in the context
+                       if offsets[start_index] is None or offsets[end_index] is None:
+                           continue
+                       # Skip answers with a length that is either < 0 or > max_answer_length
+                       if (
+                           end_index < start_index
+                           or end_index - start_index + 1 > max_answer_length
+                       ):
+                           continue
+   
+                       answer = {
+                           "text": context[offsets[start_index][0] : offsets[end_index][1]],
+                           "logit_score": start_logit[start_index] + end_logit[end_index],
+                       }
+                       answers.append(answer)
+   
+           # Select the answer with the best score
+           if len(answers) > 0:
+               best_answer = max(answers, key=lambda x: x["logit_score"])
+               predicted_answers.append(
+                   {"id": example_id, "prediction_text": best_answer["text"]}
+               )
+           else:
+               predicted_answers.append({"id": example_id, "prediction_text": ""})
+   
+       theoretical_answers = [{"id": ex["id"], "answers": ex["answers"]} for ex in examples]
+       return metric.compute(predictions=predicted_answers, references=theoretical_answers)
+   ```
+
+   Let's test it out:
+
+   ```python
+   compute_metrics(start_logits, end_logits, eval_set, small_eval_set)
+   '{'exact_match': 83.0, 'f1': 88.25}'
+   ```
+
+Ok now let's actually fine-tune the model using the HF trainer. In order to do this we will:
+
+1. Load in our model
+2. Define training arguements
+3. Instantiate Trainer
+4. Train!
+5. Evaluate
+
+```python
+# Load in model
+model = AutoModelForQuestionAnswering.from_pretrained(model_checkpoint)
+
+# Define training arguements
+from transformers import TrainingArguments
+
+args = TrainingArguments(
+    "bert-finetuned-squad",
+    evaluation_strategy="no",
+    save_strategy="epoch",
+    learning_rate=2e-5,
+    num_train_epochs=3,
+    weight_decay=0.01,
+    fp16=True,
+    push_to_hub=False,
+)
+
+# Instantiate Trainer
+from transformers import Trainer
+
+trainer = Trainer(
+    model=model,
+    args=args,
+    train_dataset=train_dataset,
+    eval_dataset=validation_dataset,
+    tokenizer=tokenizer,
+)
+
+# Train!
+trainer.train()
+
+# Evaluate
+predictions, _, _ = trainer.predict(validation_dataset)
+start_logits, end_logits = predictions
+compute_metrics(start_logits, end_logits, validation_dataset, raw_datasets["validation"])
+
+"{'exact_match': 81.18259224219489, 'f1': 88.67381321905516}"
+```
+
+
+
 ### A custom training loop
+
+Before running our custom training loop we must first create our data loaders:
+
+```python
+from torch.utils.data import DataLoader
+from transformers import default_data_collator
+
+train_dataset.set_format("torch")
+validation_set = validation_dataset.remove_columns(["example_id", "offset_mapping"])
+validation_set.set_format("torch")
+
+# We use default_data_collator as our collte_fn to shuffle our train data
+train_dataloader = DataLoader(
+    train_dataset,
+    shuffle=True,
+    collate_fn=default_data_collator,
+    batch_size=8,
+)
+eval_dataloader = DataLoader(
+    validation_set, collate_fn=default_data_collator, batch_size=8
+)
+```
+
+Then we need to reinstantiate our model:
+
+```python
+model = AutoModelForQuestionAnswering.from_pretrained(model_checkpoint)
+```
+
+Get an optimizer:
+
+```python
+from torch.optim import AdamW
+
+optimizer = AdamW(model.parameters(), lr=2e-5)
+```
+
+Pass our optimizer, model, and data loaders to accelerate:
+
+```python
+from accelerate import Accelerator
+
+accelerator = Accelerator(fp16=True)
+model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
+    model, optimizer, train_dataloader, eval_dataloader
+)
+```
+
+And create a learning rate scheduler:
+
+```python
+from transformers import get_scheduler
+
+num_train_epochs = 3
+num_update_steps_per_epoch = len(train_dataloader)
+num_training_steps = num_train_epochs * num_update_steps_per_epoch
+
+lr_scheduler = get_scheduler(
+    "linear",
+    optimizer=optimizer,
+    num_warmup_steps=0,
+    num_training_steps=num_training_steps,
+)
+```
+
+
 
 ### Training loop
 
+Our training loop will train, evaluate, then save the model:
+
+```python
+from tqdm.auto import tqdm
+import torch
+
+progress_bar = tqdm(range(num_training_steps))
+
+for epoch in range(num_train_epochs):
+    # Training
+    model.train()
+    for step, batch in enumerate(train_dataloader):
+        outputs = model(**batch)
+        loss = outputs.loss
+        accelerator.backward(loss)
+
+        optimizer.step()
+        lr_scheduler.step()
+        optimizer.zero_grad()
+        progress_bar.update(1)
+
+    # Evaluation
+    model.eval()
+    start_logits = []
+    end_logits = []
+    accelerator.print("Evaluation!")
+    for batch in tqdm(eval_dataloader):
+        with torch.no_grad():
+            outputs = model(**batch)
+
+        start_logits.append(accelerator.gather(outputs.start_logits).cpu().numpy())
+        end_logits.append(accelerator.gather(outputs.end_logits).cpu().numpy())
+
+    start_logits = np.concatenate(start_logits)
+    end_logits = np.concatenate(end_logits)
+    start_logits = start_logits[: len(validation_dataset)]
+    end_logits = end_logits[: len(validation_dataset)]
+
+    metrics = compute_metrics(
+        start_logits, end_logits, validation_dataset, raw_datasets["validation"]
+    )
+    print(f"epoch {epoch}:", metrics)
+
+    # Save and upload
+    accelerator.wait_for_everyone()
+    unwrapped_model = accelerator.unwrap_model(model)
+    unwrapped_model.save_pretrained(output_dir, save_function=accelerator.save)
+    if accelerator.is_main_process:
+        tokenizer.save_pretrained(output_dir)
+```
+
+
+
 ### Using the fine-tuned model
+
+Finally, lets load in the fine-tuned model and run example inference!
+
+```python
+from transformers import pipeline
+
+# Replace this with your own checkpoint
+model_checkpoint = "huggingface-course/bert-finetuned-squad"
+question_answerer = pipeline("question-answering", model=model_checkpoint)
+
+context = """
+🤗 Transformers is backed by the three most popular deep learning libraries — Jax, PyTorch and TensorFlow — with a seamless integration
+between them. It's straightforward to train your models with one before loading them for inference with the other.
+"""
+question = "Which deep learning libraries back 🤗 Transformers?"
+question_answerer(question=question, context=context)
+
+"{'score': 0.9979003071784973,
+ 'start': 78,
+ 'end': 105,
+ 'answer': 'Jax, PyTorch and TensorFlow'}"
+```
 
 
 
 ## Mastering NLP
 
+We have covered how to tackle most NLP tasks in the course material up until now. The next chapter will focus on asking for help when you run into questions and issues. 
+
+This chapter covered:
+
+- Which architectures (encoder, decoder, or encoder-decoder) are best suited for each task
+- The differences between pretraining and fine-tuning a language model
+- Training Transformer models using either the `Trainer` API and distributed training features of 🤗 Accelerate
+- The meaning and limitations of metrics like ROUGE and BLEU for text generation tasks
+- How to interact with your fine-tuned models, both on the Hub and using the `pipeline` from 🤗 Transformers
