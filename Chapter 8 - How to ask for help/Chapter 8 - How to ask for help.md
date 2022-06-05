@@ -786,7 +786,7 @@ When you encounter a bug in the HF codebase it's best practice to create an issu
 
 ### Create a minimum reproducible error
 
-Make sure you have a readable version of the code that can reproduce the error. Accessibility to reproduction is absolutely critical when looking for help./
+Make sure you have a readable version of the code that can reproduce the error. Accessibility to reproduction is absolutely critical when looking for help. This example should not have any external dependencies at all or private files/data included.
 
 ### Filling out the issue template
 
