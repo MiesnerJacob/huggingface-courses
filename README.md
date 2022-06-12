@@ -6,6 +6,8 @@ This course teaches you about natural language processing (NLP) using libraries 
 
 - Chapters 5 to 8 provide a deep dive into the Datasets Library, the Tokenizers library, a walkthrough of all the common NLP use cases covered by the 🤗 Transformers library, and instructions on debugging and searching the official documentation.
 
+- Chapter 9 provides an introduction to Gradio, a framework for building Machine Learning applications. This chapter gives a deep dive into building Gradio Interfaces and Blocks.
+
 Future chapters are being developed and will be released in the near future. 
 
 I am working on the Pytorch version of the HuggingFace courses, although the syntax for the Tensorflow version is highly similar and I am familiar with Tensorflow syntax (received Tensorflow Developer Certification).
